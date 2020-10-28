@@ -433,6 +433,104 @@ func TestShutdownOrder(t *testing.T) {
 	waitFinished(t, finished, shutdownOrderingTimeout)
 }
 
+// TestShutdownOrderWithHealthyCondition
+func TestShutdownOrderWithHealthyCondition(t *testing.T) {
+	shutdownOrderingTimeout := 120 * time.Second
+	taskEngine, done, _ := setupWithDefaultConfig(t)
+	defer done()
+
+	stateChangeEvents := taskEngine.StateChangeEvents()
+
+	taskArn := "testShutdownOrderWithHealthyCondition"
+	testTask := createTestTask(taskArn)
+
+	parent := createTestContainerWithImageAndName(baseImageForOS, "parent")
+	A := createTestContainerWithImageAndName(baseImageForOS, "A")
+	B := createTestContainerWithImageAndName(baseImageForOS, "B")
+	C := createTestContainerWithImageAndName(baseImageForOS, "C")
+
+	parent.EntryPoint = &entryPointForOS
+	parent.Command = []string{"echo hi"}
+	parent.Essential = true
+	parent.DependsOnUnsafe = []apicontainer.DependsOn{
+		{
+			ContainerName: "A",
+			Condition:     "HEALTHY",
+		},
+	}
+
+	A.EntryPoint = &entryPointForOS
+	A.Command = []string{"sleep 100"}
+	A.DependsOnUnsafe = []apicontainer.DependsOn{
+		{
+			ContainerName: "B",
+			Condition:     "HEALTHY",
+		},
+	}
+	A.HealthCheckType = apicontainer.DockerHealthCheckType
+	A.DockerConfig.Config = aws.String(alwaysHealthyHealthCheckConfig)
+
+	B.EntryPoint = &entryPointForOS
+	B.Command = []string{"sleep 100"}
+	B.DependsOnUnsafe = []apicontainer.DependsOn{
+		{
+			ContainerName: "C",
+			Condition:     "HEALTHY",
+		},
+	}
+	B.HealthCheckType = apicontainer.DockerHealthCheckType
+	B.DockerConfig.Config = aws.String(alwaysHealthyHealthCheckConfig)
+
+	C.EntryPoint = &entryPointForOS
+	C.Command = []string{"sleep 100"}
+	C.HealthCheckType = apicontainer.DockerHealthCheckType
+	C.DockerConfig.Config = aws.String(alwaysHealthyHealthCheckConfig)
+
+	testTask.Containers = []*apicontainer.Container{
+		parent,
+		A,
+		B,
+		C,
+	}
+
+	go taskEngine.AddTask(testTask)
+
+	finished := make(chan interface{})
+	go func() {
+		// Make sure everything's in running state
+		verifyContainerRunningStateChange(t, taskEngine)
+		verifyContainerRunningStateChange(t, taskEngine)
+		verifyContainerRunningStateChange(t, taskEngine)
+		verifyContainerRunningStateChange(t, taskEngine)
+		verifyTaskIsRunning(stateChangeEvents, testTask)
+
+		// The shutdown order will now proceed. Parent will exit first since it has an explicit exit command.
+		event := <-stateChangeEvents
+		assert.Equal(t, event.(api.ContainerStateChange).Status, status.ContainerStopped)
+		assert.Equal(t, event.(api.ContainerStateChange).ContainerName, "parent")
+
+		// The dependency chain is A -> B -> C with condition = HEALTHY.
+		// We expect the inverse order to be followed for shutdown:
+		// A shuts down, then B, then C
+		expectedA := <-stateChangeEvents
+		assert.Equal(t, expectedA.(api.ContainerStateChange).Status, status.ContainerStopped)
+		assert.Equal(t, expectedA.(api.ContainerStateChange).ContainerName, "A")
+
+		expectedB := <-stateChangeEvents
+		assert.Equal(t, expectedB.(api.ContainerStateChange).Status, status.ContainerStopped)
+		assert.Equal(t, expectedB.(api.ContainerStateChange).ContainerName, "B")
+
+		expectedC := <-stateChangeEvents
+		assert.Equal(t, expectedC.(api.ContainerStateChange).Status, status.ContainerStopped)
+		assert.Equal(t, expectedC.(api.ContainerStateChange).ContainerName, "C")
+
+		verifyTaskIsStopped(stateChangeEvents, testTask)
+		close(finished)
+	}()
+
+	waitFinished(t, finished, shutdownOrderingTimeout)
+}
+
 func TestMultipleContainerDependency(t *testing.T) {
 	taskEngine, done, _ := setupWithDefaultConfig(t)
 	defer done()
